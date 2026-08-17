@@ -19,8 +19,8 @@ import zipfile
 from pathlib import Path
 from urllib.parse import quote
 
-from aiohttp import ClientSession, ClientTimeout, WSMsgType, web
-from aiohttp.client_exceptions import ClientConnectionResetError, ClientConnectorError
+from aiohttp import ClientSession, ClientTimeout, ClientWSTimeout, WSMsgType, web
+from aiohttp.client_exceptions import ClientConnectionResetError, ClientError
 
 
 DATA_ROOT = Path(os.getenv("DATA_ROOT", "/data")).resolve()
@@ -38,6 +38,7 @@ DEVICE_DB_PATH = RUNTIME_DIR / "device-stats.json"
 WEB_PORT = int(os.getenv("WEB_PORT", "80"))
 XRAY_UPSTREAM_PORT = int(os.getenv("XRAY_BRIDGE_UPSTREAM_PORT", "10080"))
 HEALTHCHECK_SEC = max(5, int(os.getenv("AMVERA_HEALTHCHECK_SEC", "15")))
+XRAY_WS_HANDSHAKE_TIMEOUT_SEC = max(1.0, float(os.getenv("XRAY_WS_HANDSHAKE_TIMEOUT_SEC", "5")))
 ADMIN_USER = (os.getenv("ADMIN_USER") or "admin").strip()
 ADMIN_PASSWORD = (os.getenv("ADMIN_PASSWORD") or "change-me-now").strip()
 AUTH_COOKIE = "xadmin"
@@ -49,25 +50,6 @@ _EGRESS_PROBE_CACHE: dict[str, object] = {"host": "", "ts": 0.0, "data": {}}
 DEFAULT_WS_PATH = "/api/e6f5774ee4c658e2"
 DEFAULT_PUBLIC_HOST = "123-efreitor2001.waw0.amvera.tech"
 UUID_SEED_VERSION = "warsaw-single-server-v1"
-MIGRATED_CLIENT_UUIDS = [
-    "fc306288-cc29-4775-b267-b750c910795c",
-    "bb34e402-9ea0-4e77-96f5-de873cd25efd",
-    "003aa409-abc9-4c8d-b305-b3f54b21c718",
-    "cb819037-3461-4851-b0fd-af29989e0804",
-    "331d59ac-9e85-4718-b491-e1649058d154",
-    "d60071bc-10d1-4a8c-9d0b-4da8a7e09ca4",
-    "d49636c2-6996-49d9-9c6b-7d865a270e63",
-    "d23dd234-4e00-403a-9223-bd30ced424a6",
-    "2ed846f6-12de-4049-a1ae-d3ce1326afe9",
-    "002d3e0a-38de-4aa1-8775-a74e48d0de34",
-    "4669f506-707f-4b7f-bf58-f49f8277a098",
-    "e64ddca6-c467-4b63-883c-4bf2056f2e14",
-    "802d157e-44e6-4183-aed6-12e63884f9f3",
-    "33fc6ede-29d7-4d26-80a6-c1d04a983d34",
-    "0ff2eaaf-2d0b-48e2-bfcb-2bb815f4d4fa",
-    "3fbff13b-1351-4a8c-bfea-4a3d08c1c3aa",
-    "9dd9c1ea-f4e9-4e8d-9605-ca3cd9b014a9",
-]
 
 
 def _log(message: str):
@@ -161,6 +143,19 @@ def _unique_preserve_order(values: list[str]) -> list[str]:
     return out
 
 
+def _configured_migrated_client_uuids() -> list[str]:
+    configured: list[str] = []
+    invalid_count = 0
+    for raw_value in _split_csv_env(os.getenv("XRAY_MIGRATED_CLIENT_UUIDS", "")):
+        try:
+            configured.append(str(uuid.UUID(raw_value)))
+        except ValueError:
+            invalid_count += 1
+    if invalid_count:
+        _log(f"ignored invalid migrated client UUIDs: count={invalid_count}")
+    return _unique_preserve_order(configured)
+
+
 def _write_if_missing(path: Path, content: str):
     if path.exists():
         return
@@ -180,6 +175,20 @@ def _seed_migrated_users():
     else:
         payload = {"users": [], "created_at": now}
 
+    migrated_client_uuids = _configured_migrated_client_uuids()
+    if not migrated_client_uuids:
+        # Existing /data is authoritative and must not be rewritten merely
+        # because historical credentials were removed from source control.
+        if not PANEL_DB_PATH.exists():
+            payload.setdefault("settings", {})["include_base_user"] = True
+            PANEL_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+            PANEL_DB_PATH.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            _log("initialized panel with a generated base client")
+        return
+
     migration = payload.setdefault("migration", {})
     if migration.get("uuid_seed_version") == UUID_SEED_VERSION:
         return
@@ -191,7 +200,7 @@ def _seed_migrated_users():
         if isinstance(user, dict)
     }
     added = 0
-    for index, client_uuid in enumerate(MIGRATED_CLIENT_UUIDS, start=1):
+    for index, client_uuid in enumerate(migrated_client_uuids, start=1):
         if client_uuid.lower() in existing:
             continue
         users.append(
@@ -217,7 +226,7 @@ def _seed_migrated_users():
     migration["seeded_at"] = now
     PANEL_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     PANEL_DB_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    _log(f"UUID migration seed applied: added={added}, total_preserved={len(MIGRATED_CLIENT_UUIDS)}")
+    _log(f"UUID migration seed applied: added={added}, total_preserved={len(migrated_client_uuids)}")
 
 
 def _ensure_layout():
@@ -283,14 +292,22 @@ def _build_client_url_for_uuid(client_uuid: str) -> str:
     host_header = (os.getenv("XRAY_PUBLIC_HOST_HEADER") or host).strip()
     sni = (os.getenv("XRAY_PUBLIC_SNI") or host).strip()
     fingerprint = (os.getenv("XRAY_CLIENT_FINGERPRINT") or "chrome").strip()
-    params = (
-        "encryption=none&security=tls&type=ws"
-        f"&host={quote(host_header, safe='')}"
-        f"&path={quote(ws_path, safe='/')}"
-        f"&sni={quote(sni, safe='')}"
-        f"&fp={quote(fingerprint, safe='')}"
-    )
-    return f"vless://{safe_uuid}@{host}:{public_port}?{params}#{quote('Lucifer_VPN', safe='')}"
+    params = [
+        "encryption=none",
+        "security=tls",
+        "type=ws",
+        f"path={quote(ws_path, safe='/')}",
+        f"sni={quote(sni, safe='')}",
+        f"fp={quote(fingerprint, safe='')}",
+    ]
+    # Sending the same Host as the connection address is redundant. Several
+    # clients still translate the URI's `host` parameter into the deprecated
+    # wsSettings.headers.Host field, which produces the warning seen in logs.
+    # Keep the parameter only for deployments that genuinely need a distinct
+    # reverse-proxy Host value.
+    if host_header.rstrip(".").lower() != host.rstrip(".").lower():
+        params.append(f"host={quote(host_header, safe='')}")
+    return f"vless://{safe_uuid}@{host}:{public_port}?{'&'.join(params)}#{quote('Lucifer_VPN', safe='')}"
 
 
 class PanelStore:
@@ -1244,6 +1261,44 @@ async def _health_loop(manager: XrayManager):
         await manager.ensure_running()
 
 
+async def _connect_xray_upstream(session: ClientSession, upstream: str, manager: XrayManager):
+    """Open the local Xray WebSocket with bounded handshake retries.
+
+    The timeout only covers the HTTP upgrade. Once connected, ws_receive=None
+    keeps the VPN tunnel unlimited in duration.
+    """
+    last_connect_error: Exception | None = None
+    ws_timeout = ClientWSTimeout(ws_receive=None, ws_close=5)
+
+    for attempt in range(3):
+        try:
+            ws_upstream = await asyncio.wait_for(
+                session.ws_connect(
+                    upstream,
+                    autoping=False,
+                    timeout=ws_timeout,
+                    heartbeat=30,
+                    max_msg_size=0,
+                ),
+                timeout=XRAY_WS_HANDSHAKE_TIMEOUT_SEC,
+            )
+            return ws_upstream, None
+        except (asyncio.TimeoutError, ClientError, OSError) as exc:
+            last_connect_error = exc
+            if attempt == 0:
+                await asyncio.sleep(0.25)
+                continue
+            if attempt == 1:
+                _log(f"upstream ws connect failed: {exc!r}; restarting xray and retrying")
+                try:
+                    await manager.restart()
+                except Exception as restart_exc:
+                    _log(f"xray restart failed during ws retry: {restart_exc}")
+                await asyncio.sleep(0.35)
+
+    return None, last_connect_error
+
+
 async def _proxy_ws(request: web.Request):
     manager: XrayManager = request.app["manager"]
     tracker: DeviceTracker = request.app["tracker"]
@@ -1262,45 +1317,24 @@ async def _proxy_ws(request: web.Request):
         return web.Response(status=204)
 
     upstream = f"ws://127.0.0.1:{XRAY_UPSTREAM_PORT}{request.rel_url}"
-    # Keep WS tunnel long-lived; total timeout can break active VPN sessions.
-    timeout = None
-
     try:
         await manager.ensure_running()
     except Exception as exc:
         _log(f"xray ensure_running failed before ws proxy: {exc}")
 
-    async with ClientSession() as session:
-        ws_upstream = None
-        last_connect_error: Exception | None = None
-        for attempt in range(3):
-            try:
-                ws_upstream = await session.ws_connect(
-                    upstream,
-                    autoping=False,
-                    timeout=timeout,
-                    heartbeat=30,
-                    max_msg_size=0,
-                )
-                last_connect_error = None
-                break
-            except (ClientConnectorError, OSError) as exc:
-                last_connect_error = exc
-                if attempt == 0:
-                    # Freshly restarted xray may need a short warmup window.
-                    await asyncio.sleep(0.25)
-                    continue
-                if attempt == 1:
-                    _log(f"upstream ws connect failed: {exc}; restarting xray and retrying")
-                    try:
-                        await manager.restart()
-                    except Exception as restart_exc:
-                        _log(f"xray restart failed during ws retry: {restart_exc}")
-                    await asyncio.sleep(0.35)
-                    continue
+    # The session itself has no total timeout: established VPN tunnels may be
+    # long-lived. _connect_xray_upstream bounds only the HTTP upgrade phase.
+    session_timeout = ClientTimeout(
+        total=None,
+        connect=XRAY_WS_HANDSHAKE_TIMEOUT_SEC,
+        sock_connect=XRAY_WS_HANDSHAKE_TIMEOUT_SEC,
+        sock_read=None,
+    )
+    async with ClientSession(timeout=session_timeout) as session:
+        ws_upstream, last_connect_error = await _connect_xray_upstream(session, upstream, manager)
 
         if ws_upstream is None:
-            _log(f"upstream ws unavailable after retry: {last_connect_error}")
+            _log(f"upstream ws unavailable after retry: {last_connect_error!r}")
             return web.Response(status=503, text="upstream unavailable")
 
         try:
