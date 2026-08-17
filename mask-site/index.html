@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Admin Login</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background: #f4f6f8;
+      color: #1f2937;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+    }
+    .card {
+      width: 100%;
+      max-width: 360px;
+      background: #fff;
+      border: 1px solid #e5e7eb;
+      border-radius: 10px;
+      padding: 20px;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.08);
+    }
+    h1 { margin: 0 0 14px; font-size: 18px; }
+    label { display: block; margin: 10px 0 5px; font-size: 13px; color: #4b5563; }
+    input {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 10px 12px;
+      border: 1px solid #d1d5db;
+      border-radius: 8px;
+      font-size: 14px;
+    }
+    button {
+      margin-top: 14px;
+      width: 100%;
+      padding: 10px 12px;
+      border: 0;
+      border-radius: 8px;
+      background: #111827;
+      color: #fff;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    .note { margin-top: 10px; font-size: 12px; color: #6b7280; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Admin Panel</h1>
+    <form>
+      <label for="login">Login</label>
+      <input id="login" type="text" autocomplete="off" />
+      <label for="password">Password</label>
+      <input id="password" type="password" autocomplete="off" />
+      <button type="button">Sign In</button>
+    </form>
+    <div class="note">Access restricted. Unauthorized requests are logged.</div>
+  </div>
+</body>
+</html>
+
